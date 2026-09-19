@@ -1,11 +1,36 @@
 [project]
-name = "pure-eletric-backend"
+name = "pure-electric-backend"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.20.0",
+    "asyncpg>=0.30.0",
+    "bcrypt>=5.0.0",
     "fastapi[standard]>=0.141.1",
     "sqlalchemy>=2.0.54",
 ]
+
+[dependency-groups]
+dev = [
+    "aiosqlite>=0.20.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.16.8",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+exclude = [".git", ".venv", "__pycache__", "migrations"]
+cache-dir = ".ruff_cache"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
+ignore = ["B008"]
