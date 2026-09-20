@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -7,6 +8,7 @@ from databases.postgres import SessionLocal
 from routes.include_router import include_app_routers
 from seeders.user_seeder import seed_users
 from utils.logger import get_logger, setup_logging
+from workers.order import start_worker
 
 setup_logging()
 logger = get_logger("APP")
@@ -14,10 +16,11 @@ logger = get_logger("APP")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-    """Seed default users on startup, without failing when DB is unavailable."""
     try:
         async with SessionLocal() as session:
             await seed_users(session)
+
+        await asyncio.create_task(start_worker())
     except Exception as exc:
         logger.warning("User seeding skipped: %s", exc)
     yield

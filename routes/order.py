@@ -6,7 +6,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from databases.postgres import get_session
 from repositories.order import OrderRepository
 from schemas.order import OrderCreate, OrderOut
-from services.order_processor import schedule_order_processing
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -30,8 +29,4 @@ async def receive_order(
     db: AsyncSession = Depends(get_session),
 ):
     """Receive an order idempotently, queue processing, and return the order."""
-    order, created = await OrderRepository.create_or_get_order(db, payload)
-    schedule_order_processing(order.id)
-    if not created:
-        response.status_code = status.HTTP_200_OK
-    return order
+    return await OrderRepository.create_and_publish(db, payload)
