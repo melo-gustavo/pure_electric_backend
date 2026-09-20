@@ -18,5 +18,25 @@ services:
       timeout: 5s
       retries: 5
 
+  queue:
+    image: rabbitmq:4-management-alpine
+    container_name: pure_electric_queue
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - pure_electric_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   pure_electric_postgres_data:
+  pure_electric_rabbitmq_data:
