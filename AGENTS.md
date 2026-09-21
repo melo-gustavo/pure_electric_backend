@@ -9,7 +9,7 @@ Guidelines for AI agents working in this repository. **Always follow these conve
 - SQLAlchemy 2.0 **async** (typed `Mapped[...]` style) on PostgreSQL (`postgresql+asyncpg`)
 - Testing: `pytest` + `pytest-asyncio` (`asyncio_mode = "auto"`)
 - No extra comments in code unless asked.
-- Every function must have a one-line docstring describing its intent (English).
+- Every function must have a docstring describing its intent (English). One line is preferred, but it may span more when needed; it is never optional.
 
 ## Project layout
 
@@ -22,19 +22,22 @@ routes/        FastAPI routers (thin: Depends + call repository)
 workers/       Background consumers (RabbitMQ, thin: call repository)
 queues/        RabbitMQ connection/publish helpers
 databases/     Async engine/session setup (postgres.py)
-seeders/       Startup data seeding (user_seeder.py)
+seeders/       Startup data seeding (user_seeder.py, product_seeder.py)
+images/        Static catalog images served at /images (StaticFiles in main.py)
+migrations/    Alembic environment and numbered versions
 utils/         Shared helpers (security.py, logger.py)
 tests/         pytest suite
+run_worker.py  Entry point for the worker process
 ```
 
-Dependency direction: `routes → repositories → models`, `schemas` and `utils` imported where needed. `tests/` never depends on a live database.
+Dependency direction: `routes → repositories → models`, `schemas` and `utils` imported where needed. `tests/` never depends on a live service (Postgres or RabbitMQ).
 
 ## Commands
 
 - Install/sync deps: `uv sync`
 - Run tests: `uv run pytest` (spell `-q` optional). Always run after code changes.
 - Lint: `uv run ruff check . --exclude .venv --exclude migrations`
-- Format: `uv run ruff format . --exclude .venv` (then run `--check` to verify)
+- Format: `uv run ruff format . --exclude .venv --exclude migrations` (then run `--check` to verify)
 - Run a script: `uv run python -m ...`
 - Migrations: see the [Migrations (`migrations/`)](#migrations-migrations) section below.
 
@@ -68,7 +71,6 @@ id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid7)
 
 - One class per model (e.g. `UserRepository`), all methods `@staticmethod`, first arg `AsyncSession`.
 - Lookup methods return the model or `None` (`scalar_one_or_none`).
-- Add a `get_<model>_by_id_or_404` helper for routes that must 404.
 - Raise `HTTPException` from the repository with explicit HTTP status codes and English `detail` messages:
   - not found → `404`, `"User not found."`
   - duplicate phone/email/cpf/cnpj → `409`, `"A user with this <field> already exists."`
@@ -116,6 +118,19 @@ uv run alembic downgrade -1                          # rollback one step
 
 - To re-roll a migration: `uv run alembic downgrade base`, delete the file(s), then regenerate.
 
+## Seeders (`seeders/`)
+
+- One module per model (`user_seeder.py`, `product_seeder.py`) exposing `seed_<model>s(db)`.
+- Seed data lives in a module-level `SEED_<MODEL>S` list; inserts must be idempotent, keyed by a natural field (`phone` for users, `name` for products).
+- Existing rows are left untouched, except a null `image` on a product, which is filled in.
+- Register each seeder in the `lifespan` in `main.py`.
+
+## Static files (`images/`)
+
+- Product images live in `images/` and are served by `StaticFiles` mounted at `/images` in `main.py`.
+- `Product.image` stores the relative path (e.g. `/images/escape.webp`), never an absolute URL.
+- The app must be started from the project root, since the mount uses a relative directory.
+
 ## Security (`utils/security.py`)
 
 - Passwords hashed with `bcrypt` (random salt), stored in bcrypt's native format.
@@ -126,9 +141,11 @@ uv run alembic downgrade -1                          # rollback one step
 ## Logging (`utils/logger.py`)
 
 - All logging configuration lives in `utils/logger.py`:
-  - `setup_logging()` — call once at app startup (in `main.py`). It reads `LOG_LEVEL` and `SQL_ECHO`.
-  - `get_logger(__name__)` — obtain a configured module logger.
-- Never inline `logging.basicConfig` in other modules; use `get_logger(__name__)`.
+  - `setup_logging()` — installs the JSON handler once; called by `get_logger` and at app startup (`main.py`). It reads `LOG_LEVEL` and `SQL_ECHO`.
+  - `get_logger("<ENTITY>")` — obtain a configured logger named after the entity (`"USER"`, `"PRODUCT"`, `"ORDER"`); infrastructure modules use `"APP"` and `"DATABASE"`. Do not use `__name__`.
+- Logs are structured: one JSON object per line with `timestamp`, `level`, `logger`, `message`, every `extra=` field and `exception` when present.
+- Put context in `extra=` (`external_id`, `order_id`, `status`), never interpolated into the message. `extra` keys must not clash with `LogRecord` attributes (e.g. `name`, `message`).
+- Never inline `logging.basicConfig` in other modules.
 
 ## Tests (`tests/`)
 
@@ -136,6 +153,7 @@ uv run alembic downgrade -1                          # rollback one step
   `sqlite+aiosqlite://` + `StaticPool` + `connect_args={"check_same_thread": False}`, then `Base.metadata.create_all`.
 - Requests go through `httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")`.
 - Clear `app.dependency_overrides` after each test.
+- The autouse `mock_publish` fixture in `conftest.py` stubs `repositories.order.publish`; never hit a real RabbitMQ from tests.
 - Test CRUD happy paths plus 404/409/422 cases. Assert passwords are hashed (never equal plaintext) and absent from responses.
 
 ## Workers (`workers/`)
@@ -146,7 +164,7 @@ uv run alembic downgrade -1                          # rollback one step
 - Consumers use `async with message.process():` for automatic ack/nack.
 - Worker entry point is `start_worker()` async function; run as separate process.
 - Import `RABBITMQ_URL` from `queues.rabbitmq` (single source of truth).
-- Use `get_logger(__name__)` for structured logging; never `print()`.
+- Use `get_logger("<ENTITY>")` with the uppercase entity name (`"ORDER"`); pass context via `extra=`. Never `print()`.
 
 ## Queues (`queues/`)
 

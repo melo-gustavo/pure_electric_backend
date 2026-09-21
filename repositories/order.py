@@ -13,7 +13,7 @@ from queues.rabbitmq import publish
 from schemas.order import OrderCreate
 from utils.logger import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("ORDER")
 
 
 class OrderRepository:

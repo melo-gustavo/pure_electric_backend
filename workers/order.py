@@ -11,7 +11,7 @@ from queues.rabbitmq import RABBITMQ_URL
 from repositories.order import OrderRepository
 from utils.logger import get_logger
 
-logger = get_logger("WORKER_ORDERS")
+logger = get_logger("ORDER")
 
 
 QUEUE_NAME = "orders"
@@ -19,6 +19,7 @@ MOCK_REJECTION_REASON = "Internal system returned a processing failure."
 
 
 async def process_order(message: AbstractIncomingMessage):
+    """Consume an order message and drive the order to its final status."""
     async with message.process():
         data = json.loads(message.body)
         external_id = data["externalId"]
@@ -99,6 +100,7 @@ async def process_order(message: AbstractIncomingMessage):
 
 
 async def call_payment_mock() -> bool:
+    """Simulate the internal system call, succeeding on roughly half the calls."""
     await asyncio.sleep(0.5)
 
     number = random.randint(1, 100)
@@ -107,6 +109,7 @@ async def call_payment_mock() -> bool:
 
 
 async def start_worker():
+    """Connect to RabbitMQ and consume the orders queue until stopped."""
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     channel = await connection.channel()
     queue = await channel.declare_queue(QUEUE_NAME, durable=True)
