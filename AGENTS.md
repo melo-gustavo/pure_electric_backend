@@ -19,6 +19,8 @@ schemas/       Pydantic v2 request/response schemas
 enums/         Shared enums (e.g. DocumentType in enums/user.py)
 repositories/  Data access layer (one class per model)
 routes/        FastAPI routers (thin: Depends + call repository)
+workers/       Background consumers (RabbitMQ, thin: call repository)
+queues/        RabbitMQ connection/publish helpers
 databases/     Async engine/session setup (postgres.py)
 seeders/       Startup data seeding (user_seeder.py)
 utils/         Shared helpers (security.py, logger.py)
@@ -135,3 +137,22 @@ uv run alembic downgrade -1                          # rollback one step
 - Requests go through `httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")`.
 - Clear `app.dependency_overrides` after each test.
 - Test CRUD happy paths plus 404/409/422 cases. Assert passwords are hashed (never equal plaintext) and absent from responses.
+
+## Workers (`workers/`)
+
+- One module per resource (e.g. `workers/order.py`), thin: consume from queue → call repository.
+- Use `aio_pika` with `connect_robust` for connection resilience.
+- Declare queues as `durable=True`; messages published with `DeliveryMode.PERSISTENT`.
+- Consumers use `async with message.process():` for automatic ack/nack.
+- Worker entry point is `start_worker()` async function; run as separate process.
+- Import `RABBITMQ_URL` from `queues.rabbitmq` (single source of truth).
+- Use `get_logger(__name__)` for structured logging; never `print()`.
+
+## Queues (`queues/`)
+
+- Single module `rabbitmq.py` with:
+  - `RABBITMQ_URL` from env var (loaded at import).
+  - `get_channel()` — returns a robust channel (new connection each call).
+  - `publish(queue_name: str, message: str)` — declares queue, publishes persistent message.
+- All config from env vars; keep secrets only in `.env`.
+- Queues and exchanges are declared lazily on first publish/consume.

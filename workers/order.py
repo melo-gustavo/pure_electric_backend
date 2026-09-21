@@ -11,10 +11,11 @@ from queues.rabbitmq import RABBITMQ_URL
 from repositories.order import OrderRepository
 from utils.logger import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("WORKER_ORDERS")
 
 
 QUEUE_NAME = "orders"
+MOCK_REJECTION_REASON = "Internal system returned a processing failure."
 
 
 async def process_order(message: AbstractIncomingMessage):
@@ -26,10 +27,31 @@ async def process_order(message: AbstractIncomingMessage):
         async with SessionLocal() as db:
             repo = OrderRepository()
 
+            order = await repo.get_by_external_id(db, external_id)
+            if not order:
+                logger.warning(
+                    "Order not found, skipping", extra={"external_id": external_id}
+                )
+                return
+
+            if order.status in (OrderStatus.PROCESSED, OrderStatus.FAILED):
+                logger.info(
+                    "Order already processed, skipping duplicate message",
+                    extra={"external_id": external_id, "status": order.status.value},
+                )
+                return
+
+            if order.status == OrderStatus.PROCESSING:
+                logger.warning(
+                    "Order already being processed, skipping duplicate message",
+                    extra={"external_id": external_id},
+                )
+                return
+
             try:
                 await repo.update_status(db, external_id, OrderStatus.PROCESSING)
                 logger.info(
-                    f"Order status updated to {OrderStatus.PROCESSING.value}",
+                    "Order status updated to PROCESSING",
                     extra={
                         "external_id": external_id,
                         "status": OrderStatus.PROCESSING.value,
@@ -38,20 +60,42 @@ async def process_order(message: AbstractIncomingMessage):
 
                 success = await call_payment_mock()
 
-                final_status = OrderStatus.PROCESSED if success else OrderStatus.FAILED
-                await repo.update_status(db, external_id, final_status)
-                logger.info(
-                    f"Order processing completed with status: {final_status.value}",
-                    extra={"external_id": external_id, "status": final_status.value},
-                )
+                if success:
+                    await repo.update_status(db, external_id, OrderStatus.PROCESSED)
+                    logger.info(
+                        "Order processing completed",
+                        extra={
+                            "external_id": external_id,
+                            "status": OrderStatus.PROCESSED.value,
+                        },
+                    )
+                else:
+                    await repo.update_status(
+                        db,
+                        external_id,
+                        OrderStatus.FAILED,
+                        failure_reason=MOCK_REJECTION_REASON,
+                    )
+                    logger.warning(
+                        "Order rejected by the internal system",
+                        extra={
+                            "external_id": external_id,
+                            "status": OrderStatus.FAILED.value,
+                            "failure_reason": MOCK_REJECTION_REASON,
+                        },
+                    )
 
             except Exception as e:
                 logger.exception(
-                    f"""Order processing {OrderStatus.FAILED.value}
-                    for external_id: {external_id}""",
+                    "Order processing failed",
                     extra={"external_id": external_id, "error": str(e)},
                 )
-                await repo.update_status(db, external_id, OrderStatus.FAILED)
+                await repo.update_status(
+                    db,
+                    external_id,
+                    OrderStatus.FAILED,
+                    failure_reason=str(e)[:500],
+                )
 
 
 async def call_payment_mock() -> bool:

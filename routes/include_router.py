@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 
 from routes.order import router as order_router
+from routes.product import router as product_router
 from routes.user import router as user_router
 
-ROUTERS = (user_router, order_router)
+ROUTERS = (user_router, order_router, product_router)
 
 
 def include_app_routers(app: FastAPI) -> None:
