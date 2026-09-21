@@ -22,7 +22,7 @@ RECEIVED ──► PROCESSING ──► PROCESSED
 | Banco | **PostgreSQL 18** | O fluxo depende de transações confiáveis e de uma restrição `UNIQUE` como última linha de defesa da idempotência. Entrega ACID, `SELECT ... FOR UPDATE`, `UUID` nativo (usado como PK) e enum nativo. |
 | ORM / migrações | **SQLAlchemy 2.0 async + Alembic** | Estilo tipado (`Mapped[...]`), sessão assíncrona com `asyncpg` e migrações versionadas com numeração sequencial. |
 | Mensageria | **RabbitMQ 4 (AMQP)** | Desacopla o recebimento HTTP do processamento. Filas `durable` + mensagens `PERSISTENT` sobrevivem a reinício do broker, o ack é por mensagem (`message.process()`) e o broker é o caminho natural para os itens bônus de retry e dead-letter queue. |
-| Testes | **pytest + pytest-asyncio** | Suíte contra SQLite em memória, sem depender de banco vivo. |
+| Testes | **pytest + pytest-asyncio** | Suíte contra SQLite em memória, sem depender de Postgres nem de RabbitMQ (o `publish` é mockado em `tests/conftest.py`). |
 | Lint / format | **ruff** | Lint e formatação em uma ferramenta só, com configuração no `pyproject.toml`. |
 | Frontend | **React** | Escolha para a interface de consulta. **Não implementada nesta entrega** (item não obrigatório no desafio) — ver [Pendências](#10-pendências). |
 
@@ -35,7 +35,7 @@ HTTP além de levantar `HTTPException` no status correto.
 ## 2. Estrutura
 
 ```
-main.py            App FastAPI, lifespan com seeding de usuários, registro dos routers
+main.py            App FastAPI, lifespan com seeding de usuários e produtos, mount de /images, registro dos routers
 routes/            Camada HTTP (fina): Depends(get_session), chama o repository
   include_router.py  Tupla ROUTERS — único ponto de registro de routers
 repositories/      Acesso a dados e regras transacionais; HTTPException (404/409) mora aqui
@@ -45,8 +45,10 @@ enums/             StrEnum compartilhado (OrderStatus, DocumentType)
 queues/            Conexão e publish no RabbitMQ
 workers/           Consumidor da fila de pedidos + sistema interno simulado
 databases/         Engine e sessão async do Postgres
-seeders/           Dados iniciais de usuários
-utils/             Logger e hash de senha (bcrypt)
+seeders/           Dados iniciais (users e products), idempotentes por chave natural
+utils/             Logger JSON estruturado e hash de senha (bcrypt)
+images/            Imagens do catálogo servidas em /images (StaticFiles)
+run_worker.py      Entry point do worker (processo separado da API)
 migrations/        Alembic (env async) + versões numeradas 0001_, 0002_ ...
 tests/             Suíte pytest com SQLite em memória
 ```
@@ -59,7 +61,7 @@ tests/             Suíte pytest com SQLite em memória
 
 ```bash
 cp .env.example .env          # preencha as credenciais
-docker compose --profile bundled-db up -d
+docker compose up -d
 uv sync
 uv run alembic upgrade head
 ```
@@ -82,18 +84,17 @@ uv run python run_worker.py
 ```bash
 uv run pytest
 uv run ruff check . --exclude .venv --exclude migrations
-uv run ruff format . --exclude .venv --check
+uv run ruff format . --exclude .venv --exclude migrations --check
 ```
 
 ### Detalhes de infraestrutura
 
-- O serviço `db` está no profile `bundled-db`, então `docker compose up -d` sobe
-  apenas o RabbitMQ — permite usar um Postgres já existente na máquina.
+- `docker compose up -d` sobe o Postgres (`db`) e o RabbitMQ (`queue`).
 - O Postgres do compose é publicado na porta **5433** (e não 5432) para não
   conflitar com um Postgres local. Ajuste `DATABASE_PORT` no `.env`.
 - RabbitMQ: `5672` (AMQP) e `15672` (management UI, `http://localhost:15672`).
-- No startup a API executa o seeder: insere 5 usuários fixos se ainda não existirem.
-  Se o banco estiver indisponível, o erro é logado e a API sobe mesmo assim.
+- No startup a API executa os seeders: insere 5 usuários e 7 produtos fixos se ainda
+  não existirem (produtos são identificados pelo `name`). Se o banco estiver indisponível, o erro é logado e a API sobe mesmo assim.
 
 ### Solução de problemas
 
@@ -142,7 +143,8 @@ quebra, mas o pedido nunca vai ser processado e não há rastro além do log.
 | `GET` | `/orders` | Lista os pedidos com o status atual. |
 | `GET` | `/orders/{order_id}` | Consulta um pedido por ID. **404** se não existir. |
 | `GET/POST/PATCH/DELETE` | `/users`, `/users/{id}` | CRUD de usuários (senha sempre em bcrypt, nunca retornada). |
-| `GET/POST/PATCH/DELETE` | `/products`, `/products/{id}` | CRUD do catálogo de produtos. |
+| `GET/POST/PATCH/DELETE` | `/products`, `/products/{id}` | CRUD do catálogo de produtos. O campo `image` guarda o caminho relativo (ex.: `/images/escape.webp`). |
+| `GET` | `/images/{arquivo}` | Imagem estática do produto (arquivos de `images/`). |
 
 ### Receber um pedido
 
@@ -319,9 +321,6 @@ O que foi deliberadamente simplificado:
   compose` e `alembic`, documentados na seção [Como rodar](#3-como-rodar);
   automação foi considerada fora do timebox.
 - **Sem paginação nem filtro por status** em `GET /orders`.
-- **Logs em texto**, não JSON estruturado. Os campos de correlação são passados via
-  `extra=`, mas o formatter atual não os imprime — na prática o `order_id` não
-  aparece na linha de log.
 - **Modelo de itens do pedido removido.** Chegou a existir `OrderItem`
   (`order_items`, com `product_id`, `quantity` e `unit_price`) mais o vínculo
   `orders.user_id`. Nenhum endpoint criava itens e o payload do desafio não tem
@@ -347,7 +346,7 @@ O que ficou de fora e como seria implementado:
 | 5 | Timeout na chamada ao sistema interno | Passar `timeout` explícito no cliente HTTP e tratar o timeout como falha recuperável (com retry), não como `FAILED` definitivo. |
 | 6 | Filtros e paginação | `GET /orders?status=FAILED&limit=&offset=` com índices em `status` e `created_at`. |
 | 7 | Downgrade das migrações | Os enums nativos (`order_status`, `document_type`) não são removidos no `downgrade`, então `alembic downgrade base` seguido de `upgrade head` falha com "type already exists". Corrigir com `sa.Enum(..., name=...).drop(op.get_bind())` e/ou `naming_convention` no metadata para nomear constraints geradas. |
-| 8 | Logs estruturados e correlação | Formatter JSON incluindo os campos de `extra`, com `correlation_id` (`external_id`) propagado por `contextvars` e presente em toda linha da requisição e do worker. |
+| 8 | Correlação nos logs | Os logs já são JSON com os campos de `extra`. Falta propagar um `correlation_id` (`external_id`) por `contextvars` para que apareça em toda linha da requisição e do worker, inclusive nas que não o passam em `extra`. |
 | 9 | Testes do worker | Testar `process_order` diretamente com a `session_factory` dos testes e `call_payment_mock` mockado, cobrindo `RECEIVED → PROCESSING → PROCESSED`, o caminho de `FAILED` e o cenário de mensagem duplicada. Exige tornar a falha determinística (pendência do mock aleatório). |
 | 10 | Reuso do canal do RabbitMQ | `get_channel()` abre uma conexão nova a cada `publish` e não fecha; manter um canal com lock ou usar `connect_robust` em bloco para evitar acúmulo de conexões. |
 | 11 | Autenticação e proteção de dados | Assinatura HMAC no webhook, autenticação nos endpoints de consulta e mascaramento de CPF/CNPJ nas respostas. |
@@ -357,8 +356,6 @@ O que ficou de fora e como seria implementado:
 ---
 
 ## 11. Uso de Inteligência Artificial
-
-> Ajuste os nomes de ferramentas conforme o uso real.
 
 **Ferramenta utilizada:** assistente de IA com agente de código em CLI.
 
@@ -375,7 +372,7 @@ O que ficou de fora e como seria implementado:
 
 **Como o código foi revisado e validado:**
 
-- `uv run pytest` — 38 testes passando (CRUD, idempotência incluindo a recuperação
+- `uv run pytest` — 38 testes passando, sem depender de serviços externos (CRUD, idempotência incluindo a recuperação
   do `IntegrityError`, formatos de payload, 404/422 e a camada de publicação na fila).
 - `uv run ruff check` e `uv run ruff format --check` sem pendências.
 - `uv run alembic check` — nenhuma divergência entre os models e o schema do banco.

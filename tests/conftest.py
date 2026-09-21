@@ -1,3 +1,6 @@
+from unittest.mock import AsyncMock
+
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -6,6 +9,14 @@ from sqlalchemy.pool import StaticPool
 from databases.postgres import get_session
 from main import app
 from models.base_model import Base
+
+
+@pytest.fixture(autouse=True)
+def mock_publish(monkeypatch):
+    """Replace the RabbitMQ publish used by the order repository with a stub."""
+    stub = AsyncMock()
+    monkeypatch.setattr("repositories.order.publish", stub)
+    return stub
 
 
 @pytest_asyncio.fixture

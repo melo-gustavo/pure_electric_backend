@@ -6,7 +6,7 @@ from models.user import User
 from utils.logger import get_logger
 from utils.security import SecurityUtils
 
-logger = get_logger("SEEDER")
+logger = get_logger("USER")
 
 SEED_USERS: list[dict] = [
     {
