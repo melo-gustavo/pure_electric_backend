@@ -8,10 +8,13 @@ from enums.order import OrderStatus
 
 
 class OrderCreate(BaseModel):
-    external_id: str = Field(min_length=1, max_length=100, examples=["ORDER-123"])
+    model_config = ConfigDict(validate_by_name=True)
+
+    external_id: str = Field(
+        alias="externalId", min_length=1, max_length=100, examples=["ORDER-123"]
+    )
     customer: str = Field(min_length=2, max_length=255, examples=["Cliente Exemplo"])
     amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2, examples=[150.00])
-    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class OrderOut(BaseModel):
