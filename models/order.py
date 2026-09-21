@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Enum, Numeric, String
+from sqlalchemy import DateTime, Enum, Index, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from enums.order import OrderStatus
@@ -12,6 +12,7 @@ from .base_model import Base
 
 class Order(Base):
     __tablename__ = "orders"
+    __table_args__ = (Index("ix_orders_status_created_at", "status", "created_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid7)
     external_id: Mapped[str] = mapped_column(

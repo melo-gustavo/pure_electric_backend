@@ -24,7 +24,7 @@ RECEIVED ──► PROCESSING ──► PROCESSED
 | Mensageria | **RabbitMQ 4 (AMQP)** | Desacopla o recebimento HTTP do processamento. Filas `durable` + mensagens `PERSISTENT` sobrevivem a reinício do broker, o ack é por mensagem (`message.process()`) e o broker é o caminho natural para os itens bônus de retry e dead-letter queue. |
 | Testes | **pytest + pytest-asyncio** | Suíte contra SQLite em memória, sem depender de Postgres nem de RabbitMQ (o `publish` é mockado em `tests/conftest.py`). |
 | Lint / format | **ruff** | Lint e formatação em uma ferramenta só, com configuração no `pyproject.toml`. |
-| Frontend | **React** | Escolha para a interface de consulta. **Não implementada nesta entrega** (item não obrigatório no desafio) — ver [Pendências](#10-pendências). |
+| Frontend | **React + Vite** | Interface de compra e consulta de pedidos com atualização periódica (repositório `pure_electric_frontend`). |
 
 **Dependência entre camadas:** `routes → repositories → models`. `schemas` e `utils`
 são importados onde necessário. Nenhuma rota escreve SQL, nenhum repository conhece
@@ -43,7 +43,8 @@ models/            ORM SQLAlchemy 2.0 (Mapped[...] + mapped_column)
 schemas/           Pydantic v2 (Create / Update / Out)
 enums/             StrEnum compartilhado (OrderStatus, DocumentType)
 queues/            Conexão e publish no RabbitMQ
-workers/           Consumidor da fila de pedidos + sistema interno simulado
+workers/           Consumidor da fila de pedidos (claim, retry, estados finais)
+integrations/      Sistema interno simulado (separado da API e do worker)
 databases/         Engine e sessão async do Postgres
 seeders/           Dados iniciais (users e products), idempotentes por chave natural
 utils/             Logger JSON estruturado e hash de senha (bcrypt)
@@ -111,7 +112,7 @@ docker exec pure_electric_queue rabbitmqctl list_queues \
 | Saída | Significado |
 |---|---|
 | `messages_ready > 0` e `consumers = 0` | As mensagens foram publicadas, mas ninguém está consumindo. Basta subir o worker — elas continuam na fila e são processadas. |
-| `messages_ready = 0` e `consumers = 0` | Fila vazia e worker fora do ar. Se o pedido segue `RECEIVED`, a mensagem já foi consumida e descartada; não há reprocessamento automático (ver *Reprocessamento manual* em [Pendências](#10-pendências)). |
+| `messages_ready = 0` e `consumers = 0` | Fila vazia e worker fora do ar. Se o pedido segue `RECEIVED`, a mensagem já foi consumida e descartada; use `POST /orders/{id}/reprocess` para recolocá-lo na fila. |
 | `consumers >= 1` | O worker está conectado; confira o log dele. |
 
 Também é possível inspecionar em `http://localhost:15672` → Queues → `orders`,
@@ -125,9 +126,9 @@ Duas observações sobre o worker:
   só encerre com `Ctrl+C` quando quiser parar.
 - O worker precisa enxergar o mesmo `.env` e o mesmo banco que a API, senão
   encontrará o pedido como inexistente e descartará a mensagem com
-  `Order not found, skipping`.
+  `Order not claimable (missing or already handled), skipping`.
 
-E um alerta sobre esse log: `Order not found, skipping` significa que a mensagem foi
+E um alerta sobre esse log: `Order not claimable (missing or already handled), skipping` significa que a mensagem foi
 **confirmada e descartada** — não há dead-letter queue. Um caso concreto: a fila é
 `durable`, então ela sobrevive a um `alembic downgrade base` (que derruba a tabela
 `orders`), e as mensagens seguem apontando para pedidos que não existem mais. Nada
@@ -140,8 +141,9 @@ quebra, mas o pedido nunca vai ser processado e não há rastro além do log.
 | Método | Rota | Descrição |
 |---|---|---|
 | `POST` | `/orders` | Recebe um pedido. **201** se criado, **200** se o `external_id` já existia. |
-| `GET` | `/orders` | Lista os pedidos com o status atual. |
+| `GET` | `/orders` | Página de pedidos, mais recentes primeiro. Query: `status` (opcional, repetível: `?status=RECEIVED&status=PROCESSING`), `limit` (1–200, padrão 50) e `offset` (≥ 0). Resposta: `{items, total, limit, offset}`; `total` é a contagem com o filtro aplicado. |
 | `GET` | `/orders/{order_id}` | Consulta um pedido por ID. **404** se não existir. |
+| `POST` | `/orders/{order_id}/reprocess` | Recoloca um pedido `FAILED` (ou `RECEIVED` preso) na fila. **202**; **409** em qualquer outro status; **404** se não existir. |
 | `GET/POST/PATCH/DELETE` | `/users`, `/users/{id}` | CRUD de usuários (senha sempre em bcrypt, nunca retornada). |
 | `GET/POST/PATCH/DELETE` | `/products`, `/products/{id}` | CRUD do catálogo de produtos. O campo `image` guarda o caminho relativo (ex.: `/images/escape.webp`). |
 | `GET` | `/images/{arquivo}` | Imagem estática do produto (arquivos de `images/`). |
@@ -194,22 +196,47 @@ POST /orders
    │     ├─ existe → 200 (payload ignorado, nada é enfileirado)
    │     └─ não existe → INSERT status=RECEIVED → 201
    ├─ publish na fila "orders" (durable, PERSISTENT)
-   │
+   │     └─ broker fora → loga, pedido segue RECEIVED, resposta 201
    ▼
 worker (run_worker.py)
-   ├─ busca o pedido por external_id           → não achou: log + ack
-   ├─ status PROCESSED/FAILED → ignora (reentrega)
-   ├─ status PROCESSING       → ignora (já em andamento)
-   ├─ UPDATE status = PROCESSING
-   ├─ chama o sistema interno simulado (call_payment_mock)
-   │     ├─ sucesso → UPDATE status = PROCESSED
-   │     └─ falha   → UPDATE status = FAILED
-   └─ exceção inesperada → log + UPDATE status = FAILED
+   ├─ claim atômico: UPDATE ... SET PROCESSING WHERE status = RECEIVED
+   │     └─ 0 linhas (não existe / já reivindicado / já finalizado) → ack e ignora
+   ├─ integrations.internal_system.send_order, com timeout
+   │     ├─ sucesso                   → PROCESSED
+   │     ├─ rejeição (permanente)     → FAILED, sem retry
+   │     ├─ timeout / indisponível    → retry com backoff exponencial (1s, 2s...)
+   │     │                              esgotadas as tentativas → FAILED
+   │     └─ exceção inesperada        → FAILED (motivo em failure_reason)
+   ▼
+POST /orders/{id}/reprocess: FAILED → RECEIVED e novo publish
 ```
 
 A mensagem trafega com `id`, `externalId`, `customer`, `amount`, `status` e
-`createdAt`. O worker **não** confia no status da mensagem: ele relê o pedido no
-banco antes de agir, porque a fila pode reentregar mensagens.
+`createdAt`. O worker **não** confia no status da mensagem: a decisão é tomada pelo
+claim atômico no banco, porque a fila pode reentregar mensagens.
+
+### Sistema interno simulado
+
+`integrations/internal_system.py` é separado da API e do worker (o worker só o
+enxerga por `send_order` e pelas exceções `InternalSystemRejected` e
+`InternalSystemUnavailable`). O comportamento é reproduzível pelo `externalId`:
+
+| `externalId` contém | Resultado |
+|---|---|
+| `FAIL` | rejeitado → `FAILED` imediato |
+| `DOWN` | indisponível → retries → `FAILED` |
+| `SLOW` | nunca responde → timeout → retries → `FAILED` |
+| qualquer outro | sucesso, ou rejeição aleatória com probabilidade `INTERNAL_SYSTEM_FAILURE_RATE` (padrão 0.3, usado na demo pela interface, que gera UUIDs) |
+
+```bash
+curl -X POST localhost:8000/orders -H 'Content-Type: application/json' \
+  -d '{"externalId": "ORDER-FAIL-1", "customer": "Cliente", "amount": 10}'
+```
+
+Configuração (env): `PAYMENT_MOCK_DELAY_SECONDS` (latência simulada),
+`INTERNAL_SYSTEM_FAILURE_RATE`, `INTERNAL_SYSTEM_TIMEOUT_SECONDS` (10),
+`INTERNAL_SYSTEM_MAX_ATTEMPTS` (3), `INTERNAL_SYSTEM_BACKOFF_SECONDS` (1) e
+`WORKER_PREFETCH` (5).
 
 ---
 
@@ -225,10 +252,12 @@ camadas independentes:
    Serializa as requisições concorrentes que disputam o mesmo `external_id`:
    quando a linha já existe, a segunda requisição espera o lock e cai no caminho
    "já existe" em vez de duplicar o pedido.
-3. **O worker relê o estado antes de processar.** Se a mesma mensagem chegar duas
-   vezes (reentrega do broker, retry manual, dois consumidores), o pedido é
-   ignorado quando já está `PROCESSED`, `FAILED` ou `PROCESSING`. A decisão é
-   tomada no banco, não na mensagem.
+3. **Claim atômico no worker** (`claim_for_processing`): um único
+   `UPDATE ... SET status='PROCESSING' WHERE status='RECEIVED'`. Se a mesma
+   mensagem chegar duas vezes (reentrega do broker, reprocessamento, dois
+   consumidores simultâneos), só uma execução afeta 1 linha e chama o sistema
+   interno; as demais são ignoradas. Coberto por teste com dois consumidores
+   concorrentes.
 
 **Semântica do endpoint:** `201` quando o pedido é criado e enfileirado, `200`
 quando já existia. Nunca `409` — reentrega é um cenário esperado, não um erro do
@@ -247,30 +276,23 @@ forçando as duas a passar pelo SELECT antes de qualquer INSERT: um vencedor com
 
 ## 7. Indisponibilidade e lentidão do sistema interno
 
-O envio para o sistema interno é simulado por `call_payment_mock`, que introduz
-latência de 5 s (ajustável por `PAYMENT_MOCK_DELAY_SECONDS`, para dar tempo de ver o status `PROCESSING` na interface) e alterna entre sucesso e falha. O tratamento atual:
-
-- **Broker reiniciando entre publish e consumo:** a fila é `durable` e a mensagem é
-  publicada como `PERSISTENT`, então ela sobrevive ao reinício e é entregue quando
-  o worker voltar.
-- **Sistema interno retornando falha:** o pedido vai para `FAILED`, registra o
-  motivo em `failure_reason` e carimba `processed_at`. A mensagem é confirmada
-  (`message.process()`), evitando redelivery infinita de um erro de negócio.
-- **Exceção inesperada no worker:** capturada, logada com `logger.exception`, e o
-  pedido é marcado `FAILED` com `processed_at` e o erro em `failure_reason`
-  (truncado em 500 caracteres). A mensagem não volta para a fila.
-- **Sistema interno pendurado:** o worker fica bloqueado no `await`. Como o mock
-  roda no mesmo processo do consumidor, isso reduz o consumo daquela fila —
-  mitigação real depende de timeout na chamada, que ainda não existe.
-- **RabbitMQ indisponível no momento do publish:** a exceção sobe para o cliente
-  (500) depois do pedido já ter sido gravado. O pedido fica em `RECEIVED` e **não**
-  é processado automaticamente. É a falha de dual-write, descrita nas pendências.
-- **Worker cai entre `PROCESSING` e o status final:** o pedido fica preso em
-  `PROCESSING` e a mensagem já foi confirmada; nenhuma reentrega acontece. Precisa
-  de um lease/varredura de pedidos presos.
-
-Não há retry com backoff nem dead-letter queue nesta entrega — estão priorizados
-nas pendências.
+- **Lentidão:** a chamada tem timeout (`asyncio.wait_for`,
+  `INTERNAL_SYSTEM_TIMEOUT_SECONDS`). Um sistema que não responde não prende o
+  worker: estourado o tempo, conta como falha transitória.
+- **Indisponibilidade / timeout:** retry com backoff exponencial até
+  `INTERNAL_SYSTEM_MAX_ATTEMPTS`. Se o sistema voltar no meio, o pedido termina
+  `PROCESSED`; se não, `FAILED` com o motivo em `failure_reason`.
+- **Rejeição de negócio:** permanente, vai direto a `FAILED` sem retry.
+- **Recuperação:** `POST /orders/{id}/reprocess` devolve `FAILED` para `RECEIVED` e
+  republica; o claim atômico impede processamento em duplicidade.
+- **Broker fora no momento do publish:** o pedido já está gravado; o erro é logado,
+  a API responde 201 e o pedido fica `RECEIVED`, recuperável via `/reprocess`.
+- **Broker reiniciando entre publish e consumo:** fila `durable` + mensagem
+  `PERSISTENT` sobrevivem ao reinício.
+- **Exceção inesperada no worker:** logada, pedido marcado `FAILED`.
+- **Limitações assumidas:** o backoff é feito em memória no próprio consumidor (ocupa
+  um slot de prefetch durante a espera); se o worker morrer entre `PROCESSING` e o
+  estado final, o pedido fica preso em `PROCESSING` (ver pendências).
 
 ---
 
@@ -306,30 +328,24 @@ Para integrar ERP, transportadora e gateway de pagamento de forma independente:
 
 O que foi deliberadamente simplificado:
 
-- **Sistema interno como função no mesmo processo** (`call_payment_mock`) em vez de
-  serviço separado. O enunciado permite, mas acopla CPU/latência do mock ao worker.
-- **Falha simulada por sorteio** (`random.randint`) em vez de uma regra
-  determinística. Simples de escrever, porém impede teste determinístico do
-  caminho de falha.
-- **Sem retry, sem dead-letter queue e sem reprocessamento** — itens desejáveis e
-  bônus do desafio, sacrificados para fechar o fluxo essencial.
+- **Sistema interno como módulo no mesmo processo** (`integrations/internal_system.py`)
+  em vez de serviço HTTP separado. A fronteira é a mesma (função assíncrona e
+  exceções tipadas), então trocá-lo por um cliente HTTP não altera o worker.
+- **Retry em memória** (backoff dentro do consumidor) em vez de filas de retry com
+  TTL. Simples e testável; não sobrevive a queda do worker e ocupa o consumidor.
+- **Sem dead-letter queue.** Mensagem que causa erro fora do fluxo tratado é
+  descartada pelo broker.
 - **Sem autenticação.** O webhook não valida assinatura/HMAC e não há auth nos
   endpoints de consulta e CRUD.
-- **API e worker rodam direto na máquina** (só Postgres e RabbitMQ em containers),
-  sem Dockerfile para a aplicação. Mais rápido de iterar, menos próximo de produção.
-- **Sem Makefile/justfile.** Os comandos são executados direto com `uv`, `docker
-  compose` e `alembic`, documentados na seção [Como rodar](#3-como-rodar);
-  automação foi considerada fora do timebox.
-- **Sem paginação nem filtro por status** em `GET /orders`.
-- **Modelo de itens do pedido removido.** Chegou a existir `OrderItem`
-  (`order_items`, com `product_id`, `quantity` e `unit_price`) mais o vínculo
-  `orders.user_id`. Nenhum endpoint criava itens e o payload do desafio não tem
-  itens, então a tabela ficaria permanentemente vazia: código não exercitado, com
-  um `selectinload` extra em toda leitura e um `lazy load` que estouraria
-  `MissingGreenlet` assim que o primeiro item existisse. Foi removido, junto com as
-  rotas e a migração correspondente, em vez de manter estrutura sem uso.
-- **Interface visual não implementada**, apesar de a escolha de stack apontar para
-  React.
+- **Paginação por offset** em `GET /orders` (simples, mas pode pular/repetir itens se houver inserções entre páginas e fica mais lenta em offsets muito altos; a ordenação `created_at, id` e o índice `(status, created_at)` mitigam).
+- **Sem Makefile/justfile.** Comandos diretos com `uv`, `docker compose` e `alembic`.
+- **Docker Compose só para Postgres e RabbitMQ;** API e worker rodam via `uv` (o
+  `Dockerfile` é usado no deploy).
+- **Modelo de itens do pedido removido.** Chegou a existir `OrderItem`, mas nenhum
+  endpoint criava itens e o payload do desafio não os tem; foi removido em vez de
+  manter estrutura sem uso.
+- **Sem contador de tentativas persistido:** o número de tentativas só aparece nos
+  logs, não no pedido.
 
 ---
 
@@ -339,19 +355,16 @@ O que ficou de fora e como seria implementado:
 
 | # | Pendência | Como implementaria |
 |---|---|---|
-| 1 | Dual-write entre commit e publish | Padrão **outbox**: gravar o evento numa tabela `outbox` na mesma transação do pedido e um publisher separado lê e publica, marcando como enviado. Alternativa imediata: `try/except` no publish com log e endpoint de reprocessamento. |
-| 2 | Retry com backoff | Fila `orders.retry` com TTL e `x-dead-letter-exchange`: em falha, republica com `x-retry-count` e atraso exponencial; após N tentativas, vai para a DLQ. |
-| 3 | Pedido preso em `PROCESSING` | Coluna `processing_started_at` como lease e um job periódico que devolve para a fila pedidos em `PROCESSING` há mais de X minutos. |
-| 4 | Reprocessamento manual | `POST /orders/{id}/reprocess`, permitindo apenas partindo de `FAILED`, com transição para `RECEIVED` e novo publish. |
-| 5 | Timeout na chamada ao sistema interno | Passar `timeout` explícito no cliente HTTP e tratar o timeout como falha recuperável (com retry), não como `FAILED` definitivo. |
-| 6 | Filtros e paginação | `GET /orders?status=FAILED&limit=&offset=` com índices em `status` e `created_at`. |
-| 7 | Downgrade das migrações | Os enums nativos (`order_status`, `document_type`) não são removidos no `downgrade`, então `alembic downgrade base` seguido de `upgrade head` falha com "type already exists". Corrigir com `sa.Enum(..., name=...).drop(op.get_bind())` e/ou `naming_convention` no metadata para nomear constraints geradas. |
-| 8 | Correlação nos logs | Os logs já são JSON com os campos de `extra`. Falta propagar um `correlation_id` (`external_id`) por `contextvars` para que apareça em toda linha da requisição e do worker, inclusive nas que não o passam em `extra`. |
-| 9 | Testes do worker | Testar `process_order` diretamente com a `session_factory` dos testes e `call_payment_mock` mockado, cobrindo `RECEIVED → PROCESSING → PROCESSED`, o caminho de `FAILED` e o cenário de mensagem duplicada. Exige tornar a falha determinística (pendência do mock aleatório). |
-| 10 | Reuso do canal do RabbitMQ | `get_channel()` abre uma conexão nova a cada `publish` e não fecha; manter um canal com lock ou usar `connect_robust` em bloco para evitar acúmulo de conexões. |
-| 11 | Autenticação e proteção de dados | Assinatura HMAC no webhook, autenticação nos endpoints de consulta e mascaramento de CPF/CNPJ nas respostas. |
-| 12 | Testes de contrato e dead-letter queue | Contrato entre API e worker validando o envelope da mensagem; DLQ para mensagens não processáveis. |
-| 13 | Interface de consulta (React) | SPA consumindo `GET /orders` com filtro por status e atualização periódica, exibindo a transição dos estados. |
+| 1 | Dual-write entre commit e publish | Padrão **outbox**: gravar o evento numa tabela `outbox` na mesma transação do pedido e um publisher separado lê e publica. Hoje mitigado por `/reprocess`, mas não automático. |
+| 2 | Retry durável e dead-letter queue | Fila `orders.retry` com TTL e `x-dead-letter-exchange` em vez do backoff em memória; após N tentativas, DLQ com alerta. |
+| 3 | Pedido preso em `PROCESSING` | Coluna `processing_started_at` como lease e job periódico que devolve para a fila pedidos em `PROCESSING` há mais de X minutos. |
+| 4 | Circuit breaker | Abrir o circuito após falhas consecutivas para não gastar tentativas contra um sistema fora do ar. |
+| 5 | Paginação por cursor | Trocar `offset` por keyset (`created_at, id` do último item) para páginas estáveis e custo constante em volumes grandes. |
+| 6 | Downgrade das migrações | Os enums nativos (`order_status`, `document_type`) não são removidos no `downgrade`; corrigir com `sa.Enum(..., name=...).drop(op.get_bind())`. |
+| 7 | Correlação nos logs | Os logs são JSON com `external_id` em `extra`; falta propagar um `correlation_id` por `contextvars` para toda linha da requisição e do worker. |
+| 8 | Reuso do canal do RabbitMQ | `get_channel()` abre uma conexão nova a cada `publish` e não fecha; manter um canal compartilhado. |
+| 9 | Autenticação e proteção de dados | HMAC no webhook, auth nos endpoints de consulta, mascaramento de CPF/CNPJ. |
+| 10 | Testes de contrato e de integração real | Contrato do envelope da mensagem; testes contra Postgres/RabbitMQ reais (a suíte usa SQLite e mocka o publish). |
 
 ---
 
@@ -372,8 +385,8 @@ O que ficou de fora e como seria implementado:
 
 **Como o código foi revisado e validado:**
 
-- `uv run pytest` — 38 testes passando, sem depender de serviços externos (CRUD, idempotência incluindo a recuperação
-  do `IntegrityError`, formatos de payload, 404/422 e a camada de publicação na fila).
+- `uv run pytest` — 52 testes passando, sem depender de serviços externos (CRUD, idempotência incluindo a recuperação
+  do `IntegrityError`, formatos de payload, 404/422, filtro por status, reprocessamento, broker fora do ar e o worker: sucesso, rejeição, retry com recuperação, esgotamento, timeout, mensagem duplicada e consumidores concorrentes).
 - `uv run ruff check` e `uv run ruff format --check` sem pendências.
 - `uv run alembic check` — nenhuma divergência entre os models e o schema do banco.
 - Execução manual do fluxo completo com Postgres e RabbitMQ reais: `POST /orders`
@@ -422,6 +435,7 @@ pelos dois serviços do backend.
    | `DATABASE_PORT` | `${{Postgres.PGPORT}}` |
    | `RABBITMQ_URL` | `amqp://USER:SENHA@<rabbitmq>.railway.internal:5672/` |
    | `PAYMENT_MOCK_DELAY_SECONDS` | `5` (só no worker) |
+   | `INTERNAL_SYSTEM_FAILURE_RATE` | `0.3` (só no worker) |
    | `CORS_ORIGINS` | URL da Vercel, ex.: `https://meu-app.vercel.app` (só na API) |
 
    `Postgres` e `<rabbitmq>` são os nomes dos serviços criados nos passos 1 e 2.

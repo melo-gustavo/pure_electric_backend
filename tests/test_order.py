@@ -84,7 +84,9 @@ async def test_list_orders(client):
     response = await client.get("/orders")
 
     assert response.status_code == 200
-    assert len(response.json()) == 2
+    body = response.json()
+    assert len(body["items"]) == 2
+    assert body["total"] == 2
 
 
 async def test_get_order(client):
@@ -201,3 +203,125 @@ async def test_update_status_stamps_terminal_state(session_factory):
         assert processed.status == OrderStatus.PROCESSED
         assert processed.failure_reason is None
         assert processed.processed_at is not None
+
+
+async def test_list_orders_filtered_by_status(client, session_factory):
+    """GET /orders?status= returns only orders in that status."""
+    await client.post("/orders", json=CREATE_PAYLOAD)
+    await client.post("/orders", json={**CREATE_PAYLOAD, "external_id": "ORDER-002"})
+    async with session_factory() as db:
+        order = await get_order(db, external_id="ORDER-002")
+        order.status = OrderStatus.FAILED
+        await db.commit()
+
+    failed = await client.get("/orders", params={"status": "FAILED"})
+    everything = await client.get("/orders")
+    invalid = await client.get("/orders", params={"status": "NOPE"})
+
+    assert [o["external_id"] for o in failed.json()["items"]] == ["ORDER-002"]
+    assert failed.json()["total"] == 1
+    assert everything.json()["total"] == 2
+    assert invalid.status_code == 422
+
+
+async def test_list_orders_accepts_multiple_statuses(client, session_factory):
+    """Repeated ?status= matches any of the given statuses."""
+    for index, status in enumerate(
+        (OrderStatus.RECEIVED, OrderStatus.PROCESSING, OrderStatus.PROCESSED)
+    ):
+        await client.post(
+            "/orders", json={**CREATE_PAYLOAD, "external_id": f"ORDER-{index}"}
+        )
+        async with session_factory() as db:
+            order = await get_order(db, external_id=f"ORDER-{index}")
+            order.status = status
+            await db.commit()
+
+    response = await client.get(
+        "/orders", params=[("status", "RECEIVED"), ("status", "PROCESSING")]
+    )
+
+    assert response.json()["total"] == 2
+    assert {o["status"] for o in response.json()["items"]} == {
+        "RECEIVED",
+        "PROCESSING",
+    }
+
+
+async def test_list_orders_paginates_newest_first(client):
+    """limit/offset slice the newest-first list; total stays the full count."""
+    for index in range(5):
+        await client.post(
+            "/orders", json={**CREATE_PAYLOAD, "external_id": f"ORDER-{index}"}
+        )
+
+    first = (await client.get("/orders", params={"limit": 2, "offset": 0})).json()
+    second = (await client.get("/orders", params={"limit": 2, "offset": 2})).json()
+    last = (await client.get("/orders", params={"limit": 2, "offset": 4})).json()
+    beyond = (await client.get("/orders", params={"limit": 2, "offset": 10})).json()
+
+    ids = [o["external_id"] for page in (first, second, last) for o in page["items"]]
+    assert ids == [f"ORDER-{i}" for i in (4, 3, 2, 1, 0)]
+    assert first["total"] == second["total"] == last["total"] == 5
+    assert (first["limit"], second["offset"]) == (2, 2)
+    assert beyond["items"] == [] and beyond["total"] == 5
+
+
+async def test_list_orders_rejects_invalid_pagination(client):
+    """limit must be 1..200 and offset must not be negative."""
+    for params in ({"limit": 0}, {"limit": 201}, {"offset": -1}):
+        response = await client.get("/orders", params=params)
+        assert response.status_code == 422
+
+
+async def test_reprocess_failed_order_requeues_it(
+    client, session_factory, mock_publish
+):
+    """A FAILED order goes back to RECEIVED, is cleaned and republished."""
+    created = (await client.post("/orders", json=CREATE_PAYLOAD)).json()
+    async with session_factory() as db:
+        order = await get_order(db, id=uuid.UUID(created["id"]))
+        order.status = OrderStatus.FAILED
+        order.failure_reason = "boom"
+        await db.commit()
+    mock_publish.reset_mock()
+
+    response = await client.post(f"/orders/{created['id']}/reprocess")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == OrderStatus.RECEIVED.value
+    assert body["failure_reason"] is None
+    mock_publish.assert_awaited_once()
+
+
+async def test_reprocess_rejects_processed_order(client, session_factory):
+    """Only FAILED or RECEIVED orders can be reprocessed."""
+    created = (await client.post("/orders", json=CREATE_PAYLOAD)).json()
+    async with session_factory() as db:
+        order = await get_order(db, id=uuid.UUID(created["id"]))
+        order.status = OrderStatus.PROCESSED
+        await db.commit()
+
+    response = await client.post(f"/orders/{created['id']}/reprocess")
+
+    assert response.status_code == 409
+
+
+async def test_reprocess_unknown_order_returns_404(client):
+    """Reprocessing a missing order returns 404."""
+    response = await client.post(f"/orders/{uuid.uuid4()}/reprocess")
+
+    assert response.status_code == 404
+
+
+async def test_broker_down_keeps_order_received(client, session_factory, mock_publish):
+    """A publish failure still stores the order and answers 201, ready to reprocess."""
+    mock_publish.side_effect = ConnectionError("broker down")
+
+    response = await client.post("/orders", json=CREATE_PAYLOAD)
+
+    assert response.status_code == 201
+    async with session_factory() as db:
+        order = await get_order(db, external_id=CREATE_PAYLOAD["external_id"])
+        assert order.status == OrderStatus.RECEIVED

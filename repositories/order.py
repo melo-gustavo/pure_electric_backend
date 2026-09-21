@@ -3,7 +3,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,10 +18,28 @@ logger = get_logger("ORDER")
 
 class OrderRepository:
     @staticmethod
-    async def get_orders(db: AsyncSession) -> list[Order]:
-        """Return all orders."""
-        result = await db.execute(select(Order))
-        return list(result.scalars().all())
+    async def get_orders(
+        db: AsyncSession,
+        statuses: list[OrderStatus] | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[Order], int]:
+        """Return one page of orders, newest first, plus the total that matches.
+
+        Ordering by (created_at, id) keeps pages stable when timestamps tie.
+        """
+        conditions = [Order.status.in_(statuses)] if statuses else []
+        total = await db.scalar(
+            select(func.count()).select_from(Order).where(*conditions)
+        )
+        result = await db.execute(
+            select(Order)
+            .where(*conditions)
+            .order_by(Order.created_at.desc(), Order.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return list(result.scalars().all()), total or 0
 
     @staticmethod
     async def get_order_by_id(db: AsyncSession, order_id: uuid.UUID) -> Order:
@@ -149,6 +167,41 @@ class OrderRepository:
         )
         await publish("orders", json.dumps(message))
         logger.info("Order published to queue", extra={"order_id": str(order.id)})
+
+    @staticmethod
+    async def claim_for_processing(db: AsyncSession, external_id: str) -> bool:
+        """Atomically move an order from RECEIVED to PROCESSING.
+
+        Returns False when the order does not exist or was already claimed, so
+        only one consumer ever processes a given order.
+        """
+        result = await db.execute(
+            update(Order)
+            .where(
+                Order.external_id == external_id, Order.status == OrderStatus.RECEIVED
+            )
+            .values(status=OrderStatus.PROCESSING)
+            .returning(Order.id)
+        )
+        claimed = result.scalar_one_or_none()
+        await db.commit()
+        return claimed is not None
+
+    @staticmethod
+    async def reset_for_reprocessing(db: AsyncSession, order_id: uuid.UUID) -> Order:
+        """Return a FAILED or stuck RECEIVED order to RECEIVED, or raise 409."""
+        order = await OrderRepository.get_order_by_id(db, order_id)
+        if order.status not in (OrderStatus.FAILED, OrderStatus.RECEIVED):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Only FAILED or RECEIVED orders can be reprocessed.",
+            )
+        order.status = OrderStatus.RECEIVED
+        order.failure_reason = None
+        order.processed_at = None
+        await db.commit()
+        await db.refresh(order)
+        return order
 
     @staticmethod
     async def update_status(

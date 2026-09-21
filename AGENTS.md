@@ -21,6 +21,7 @@ repositories/  Data access layer (one class per model)
 routes/        FastAPI routers (thin: Depends + call repository)
 workers/       Background consumers (RabbitMQ, thin: call repository)
 queues/        RabbitMQ connection/publish helpers
+integrations/  Simulated external/internal systems called by workers (internal_system.py)
 databases/     Async engine/session setup (postgres.py)
 seeders/       Startup data seeding (user_seeder.py, product_seeder.py)
 images/        Static catalog images served at /images (StaticFiles in main.py)

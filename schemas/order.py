@@ -28,3 +28,10 @@ class OrderOut(BaseModel):
     failure_reason: str | None
     created_at: datetime
     processed_at: datetime | None
+
+
+class OrderPage(BaseModel):
+    items: list[OrderOut]
+    total: int
+    limit: int
+    offset: int

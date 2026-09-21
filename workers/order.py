@@ -1,13 +1,18 @@
 import asyncio
 import json
 import os
-import random
 
 import aio_pika
 from aio_pika.abc import AbstractIncomingMessage
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from databases.postgres import SessionLocal
 from enums.order import OrderStatus
+from integrations.internal_system import (
+    InternalSystemRejected,
+    InternalSystemUnavailable,
+    send_order,
+)
 from queues.rabbitmq import RABBITMQ_URL
 from repositories.order import OrderRepository
 from utils.logger import get_logger
@@ -16,104 +21,103 @@ logger = get_logger("ORDER")
 
 
 QUEUE_NAME = "orders"
-MOCK_DELAY_SECONDS = float(os.getenv("PAYMENT_MOCK_DELAY_SECONDS", "5"))
-MOCK_REJECTION_REASON = "Internal system returned a processing failure."
+PREFETCH_COUNT = int(os.getenv("WORKER_PREFETCH", "5"))
+INTERNAL_SYSTEM_TIMEOUT_SECONDS = float(
+    os.getenv("INTERNAL_SYSTEM_TIMEOUT_SECONDS", "10")
+)
+MAX_ATTEMPTS = int(os.getenv("INTERNAL_SYSTEM_MAX_ATTEMPTS", "3"))
+BACKOFF_BASE_SECONDS = float(os.getenv("INTERNAL_SYSTEM_BACKOFF_SECONDS", "1"))
+
+
+async def deliver_with_retry(data: dict) -> None:
+    """Send the order to the internal system, retrying transient failures.
+
+    Timeouts and unavailability are retried with exponential backoff up to
+    MAX_ATTEMPTS; a rejection is permanent and propagates immediately.
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            await asyncio.wait_for(
+                send_order(data["externalId"], data["customer"], data["amount"]),
+                timeout=INTERNAL_SYSTEM_TIMEOUT_SECONDS,
+            )
+            return
+        except (TimeoutError, InternalSystemUnavailable) as exc:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            delay = BACKOFF_BASE_SECONDS * 2 ** (attempt - 1)
+            logger.warning(
+                "Internal system call failed, retrying",
+                extra={
+                    "external_id": data["externalId"],
+                    "attempt": attempt,
+                    "retry_in_seconds": delay,
+                    "error": type(exc).__name__,
+                },
+            )
+            await asyncio.sleep(delay)
+
+
+async def handle_order(
+    session_factory: async_sessionmaker, data: dict
+) -> OrderStatus | None:
+    """Drive one order RECEIVED -> PROCESSING -> PROCESSED/FAILED.
+
+    Returns the final status, or None when the message was skipped because the
+    order is missing or was already claimed by another delivery.
+    """
+    external_id = data["externalId"]
+    logger.info("Processing order", extra={"external_id": external_id})
+
+    async with session_factory() as db:
+        if not await OrderRepository.claim_for_processing(db, external_id):
+            logger.info(
+                "Order not claimable (missing or already handled), skipping",
+                extra={"external_id": external_id},
+            )
+            return None
+
+        try:
+            await deliver_with_retry(data)
+        except InternalSystemRejected as exc:
+            final, reason = OrderStatus.FAILED, str(exc)
+        except (TimeoutError, InternalSystemUnavailable) as exc:
+            final = OrderStatus.FAILED
+            reason = (
+                f"Internal system unavailable after {MAX_ATTEMPTS} attempts "
+                f"({type(exc).__name__})."
+            )
+        except Exception as exc:
+            logger.exception(
+                "Order processing failed", extra={"external_id": external_id}
+            )
+            final, reason = OrderStatus.FAILED, str(exc)[:500]
+        else:
+            final, reason = OrderStatus.PROCESSED, None
+
+        await OrderRepository.update_status(db, external_id, final, reason)
+        logger.info(
+            "Order processing finished",
+            extra={
+                "external_id": external_id,
+                "status": final.value,
+                "failure_reason": reason,
+            },
+        )
+        return final
 
 
 async def process_order(message: AbstractIncomingMessage):
-    """Consume an order message and drive the order to its final status."""
+    """Consume an order message and hand it to handle_order."""
     async with message.process():
-        data = json.loads(message.body)
-        external_id = data["externalId"]
-        logger.info("Processing order", extra={"external_id": external_id})
-
-        async with SessionLocal() as db:
-            repo = OrderRepository()
-
-            order = await repo.get_by_external_id(db, external_id)
-            if not order:
-                logger.warning(
-                    "Order not found, skipping", extra={"external_id": external_id}
-                )
-                return
-
-            if order.status in (OrderStatus.PROCESSED, OrderStatus.FAILED):
-                logger.info(
-                    "Order already processed, skipping duplicate message",
-                    extra={"external_id": external_id, "status": order.status.value},
-                )
-                return
-
-            if order.status == OrderStatus.PROCESSING:
-                logger.warning(
-                    "Order already being processed, skipping duplicate message",
-                    extra={"external_id": external_id},
-                )
-                return
-
-            try:
-                await repo.update_status(db, external_id, OrderStatus.PROCESSING)
-                logger.info(
-                    "Order status updated to PROCESSING",
-                    extra={
-                        "external_id": external_id,
-                        "status": OrderStatus.PROCESSING.value,
-                    },
-                )
-
-                success = await call_payment_mock()
-
-                if success:
-                    await repo.update_status(db, external_id, OrderStatus.PROCESSED)
-                    logger.info(
-                        "Order processing completed",
-                        extra={
-                            "external_id": external_id,
-                            "status": OrderStatus.PROCESSED.value,
-                        },
-                    )
-                else:
-                    await repo.update_status(
-                        db,
-                        external_id,
-                        OrderStatus.FAILED,
-                        failure_reason=MOCK_REJECTION_REASON,
-                    )
-                    logger.warning(
-                        "Order rejected by the internal system",
-                        extra={
-                            "external_id": external_id,
-                            "status": OrderStatus.FAILED.value,
-                            "failure_reason": MOCK_REJECTION_REASON,
-                        },
-                    )
-
-            except Exception as e:
-                logger.exception(
-                    "Order processing failed",
-                    extra={"external_id": external_id, "error": str(e)},
-                )
-                await repo.update_status(
-                    db,
-                    external_id,
-                    OrderStatus.FAILED,
-                    failure_reason=str(e)[:500],
-                )
-
-
-async def call_payment_mock() -> bool:
-    """Simulate the internal system call, succeeding on roughly half the calls."""
-    await asyncio.sleep(MOCK_DELAY_SECONDS)
-
-    number = random.randint(1, 100)
-
-    return number % 2 == 0
+        await handle_order(SessionLocal, json.loads(message.body))
 
 
 async def start_worker():
     """Connect to RabbitMQ and consume the orders queue until stopped."""
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     channel = await connection.channel()
+    await channel.set_qos(prefetch_count=PREFETCH_COUNT)
     queue = await channel.declare_queue(QUEUE_NAME, durable=True)
     await queue.consume(process_order)
     logger.info(f"Worker listening on queue: {QUEUE_NAME}")
