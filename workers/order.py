@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import random
 
 import aio_pika
@@ -15,6 +16,7 @@ logger = get_logger("ORDER")
 
 
 QUEUE_NAME = "orders"
+MOCK_DELAY_SECONDS = float(os.getenv("PAYMENT_MOCK_DELAY_SECONDS", "5"))
 MOCK_REJECTION_REASON = "Internal system returned a processing failure."
 
 
@@ -101,7 +103,7 @@ async def process_order(message: AbstractIncomingMessage):
 
 async def call_payment_mock() -> bool:
     """Simulate the internal system call, succeeding on roughly half the calls."""
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(MOCK_DELAY_SECONDS)
 
     number = random.randint(1, 100)
 

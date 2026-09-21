@@ -248,7 +248,7 @@ forçando as duas a passar pelo SELECT antes de qualquer INSERT: um vencedor com
 ## 7. Indisponibilidade e lentidão do sistema interno
 
 O envio para o sistema interno é simulado por `call_payment_mock`, que introduz
-latência de 500 ms e alterna entre sucesso e falha. O tratamento atual:
+latência de 5 s (ajustável por `PAYMENT_MOCK_DELAY_SECONDS`, para dar tempo de ver o status `PROCESSING` na interface) e alterna entre sucesso e falha. O tratamento atual:
 
 - **Broker reiniciando entre publish e consumo:** a fila é `durable` e a mensagem é
   publicada como `PERSISTENT`, então ela sobrevive ao reinício e é entregue quando
@@ -390,3 +390,47 @@ O que ficou de fora e como seria implementado:
   o interleaving na camada de sessão.
 - Leitura linha a linha do código gerado, com as decisões de arquitetura descritas
   nas seções acima sendo de escolha própria, não da ferramenta.
+
+---
+
+## 12. Deploy (Railway + Vercel)
+
+O backend sobe no **Railway** como dois serviços do mesmo repositório (API e worker),
+mais Postgres e RabbitMQ; o frontend sobe na **Vercel**. O `Dockerfile` da raiz é usado
+pelos dois serviços do backend.
+
+**Railway** (projeto único):
+
+1. **Postgres:** *New → Database → PostgreSQL*.
+2. **RabbitMQ:** *New → Docker Image* com `rabbitmq:4-management-alpine` e as variáveis
+   `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS` e `RABBITMQ_DEFAULT_VHOST=/`. Não
+   exponha porta pública; a API e o worker falam com ele pela rede privada
+   (`<nome-do-serviço>.railway.internal:5672`).
+3. **API:** *New → GitHub Repo* (este repositório). Sem alterar o start command: o
+   `CMD` do Dockerfile roda `alembic upgrade head` e depois o `fastapi run`. Em
+   *Settings → Networking* gere um domínio público.
+4. **Worker:** outro serviço do mesmo repositório, com *Settings → Deploy → Custom Start
+   Command* `python run_worker.py` e **sem** domínio público.
+5. **Variáveis** (nos dois serviços):
+
+   | Variável | Valor |
+   |---|---|
+   | `DATABASE_USER` | `${{Postgres.PGUSER}}` |
+   | `DATABASE_PASSWORD` | `${{Postgres.PGPASSWORD}}` |
+   | `DATABASE_NAME` | `${{Postgres.PGDATABASE}}` |
+   | `DATABASE_HOST` | `${{Postgres.PGHOST}}` |
+   | `DATABASE_PORT` | `${{Postgres.PGPORT}}` |
+   | `RABBITMQ_URL` | `amqp://USER:SENHA@<rabbitmq>.railway.internal:5672/` |
+   | `PAYMENT_MOCK_DELAY_SECONDS` | `5` (só no worker) |
+   | `CORS_ORIGINS` | URL da Vercel, ex.: `https://meu-app.vercel.app` (só na API) |
+
+   `Postgres` e `<rabbitmq>` são os nomes dos serviços criados nos passos 1 e 2.
+
+**Vercel:** importe o repositório do frontend (preset Vite) e defina `VITE_API_URL` com o
+domínio público da API no Railway, sem barra final. A variável é lida no *build*, então
+mudar o valor exige um novo deploy. O `vercel.json` reescreve todas as rotas para o
+`index.html`, o que mantém `/products` e `/orders` funcionando ao recarregar a página.
+
+Depois do primeiro deploy do frontend, volte ao Railway e ajuste `CORS_ORIGINS` para a
+URL final da Vercel; várias origens são separadas por vírgula.
+
