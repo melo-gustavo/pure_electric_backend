@@ -304,7 +304,7 @@ Para integrar ERP, transportadora e gateway de pagamento de forma independente:
 
 ---
 
-## 9. Trade-offs (limite de 4 horas)
+## 9. Trade-offs
 
 O que foi deliberadamente simplificado:
 
