@@ -12,6 +12,7 @@ from models.order import Order
 from queues.rabbitmq import publish
 from schemas.order import OrderCreate
 from utils.logger import get_logger
+from utils.metrics import orders_duplicate_total, orders_received_total
 
 logger = get_logger("ORDER")
 
@@ -87,6 +88,7 @@ class OrderRepository:
             "Order created",
             extra={"order_id": str(order.id), "external_id": order.external_id},
         )
+        orders_received_total.inc()
         return order
 
     @staticmethod
@@ -118,6 +120,7 @@ class OrderRepository:
                     "status": existing.status.value,
                 },
             )
+            orders_duplicate_total.inc()
             return existing, False
 
         try:
@@ -135,6 +138,7 @@ class OrderRepository:
                     "status": existing.status.value,
                 },
             )
+            orders_duplicate_total.inc()
             return existing, False
 
         return order, True

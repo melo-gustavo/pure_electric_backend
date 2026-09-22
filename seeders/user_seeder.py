@@ -1,3 +1,5 @@
+from typing import Any
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,7 +10,7 @@ from utils.security import SecurityUtils
 
 logger = get_logger("USER")
 
-SEED_USERS: list[dict] = [
+SEED_USERS: list[dict[str, Any]] = [
     {
         "phone": "+5511999999991",
         "email": "maria.silva@example.com",

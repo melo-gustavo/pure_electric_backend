@@ -26,7 +26,12 @@ async def get_orders(
     `status` may be repeated (?status=RECEIVED&status=PROCESSING) to match any.
     """
     items, total = await OrderRepository.get_orders(db, status, limit, offset)
-    return OrderPage(items=items, total=total, limit=limit, offset=offset)
+    return OrderPage(
+        items=[OrderOut.model_validate(item) for item in items],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{order_id}", response_model=OrderOut)

@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,7 +9,7 @@ from utils.logger import get_logger
 
 logger = get_logger("PRODUCT")
 
-SEED_PRODUCTS: list[dict] = [
+SEED_PRODUCTS: list[dict[str, Any]] = [
     {
         "name": "Escape",
         "image": "/images/escape.webp",

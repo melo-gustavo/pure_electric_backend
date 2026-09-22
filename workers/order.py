@@ -1,10 +1,11 @@
 import asyncio
 import json
 import os
+from typing import Any
 
 import aio_pika
 from aio_pika.abc import AbstractIncomingMessage
-from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from databases.postgres import SessionLocal
 from enums.order import OrderStatus
@@ -16,6 +17,7 @@ from integrations.internal_system import (
 from queues.rabbitmq import RABBITMQ_URL
 from repositories.order import OrderRepository
 from utils.logger import get_logger
+from utils.metrics import orders_processed_total
 
 logger = get_logger("ORDER")
 
@@ -29,7 +31,7 @@ MAX_ATTEMPTS = int(os.getenv("INTERNAL_SYSTEM_MAX_ATTEMPTS", "3"))
 BACKOFF_BASE_SECONDS = float(os.getenv("INTERNAL_SYSTEM_BACKOFF_SECONDS", "1"))
 
 
-async def deliver_with_retry(data: dict) -> None:
+async def deliver_with_retry(data: dict[str, Any]) -> None:
     """Send the order to the internal system, retrying transient failures.
 
     Timeouts and unavailability are retried with exponential backoff up to
@@ -59,7 +61,7 @@ async def deliver_with_retry(data: dict) -> None:
 
 
 async def handle_order(
-    session_factory: async_sessionmaker, data: dict
+    session_factory: async_sessionmaker[AsyncSession], data: dict[str, Any]
 ) -> OrderStatus | None:
     """Drive one order RECEIVED -> PROCESSING -> PROCESSED/FAILED.
 
@@ -96,6 +98,7 @@ async def handle_order(
             final, reason = OrderStatus.PROCESSED, None
 
         await OrderRepository.update_status(db, external_id, final, reason)
+        orders_processed_total.labels(status=final.value).inc()
         logger.info(
             "Order processing finished",
             extra={

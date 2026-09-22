@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from databases.postgres import SessionLocal
 from routes.include_router import include_app_routers
@@ -56,3 +57,7 @@ app.add_middleware(
 app.mount("/images", StaticFiles(directory="images"), name="images")
 
 include_app_routers(app)
+
+Instrumentator().instrument(app).expose(
+    app, endpoint="/metrics", include_in_schema=False
+)
