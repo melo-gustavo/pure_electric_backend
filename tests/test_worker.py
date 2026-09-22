@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -28,7 +29,7 @@ async def create_order(client, external_id: str) -> str:
     return response.json()["id"]
 
 
-def message_for(external_id: str) -> dict:
+def message_for(external_id: str) -> dict[str, Any]:
     """Build the queue payload the worker expects for an external ID."""
     return {"externalId": external_id, "customer": "Cliente", "amount": "10.00"}
 

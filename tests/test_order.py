@@ -158,7 +158,7 @@ async def test_create_idempotent_recovers_from_integrity_error(
         monkeypatch.setattr(OrderRepository, "get_by_external_id", lookup_winner)
 
         data = OrderCreate(
-            externalId="ORDER-LOSER", customer="Cliente Teste", amount="150.00"
+            externalId="ORDER-LOSER", customer="Cliente Teste", amount=Decimal("150.00")
         )
         order, created = await OrderRepository.create_idempotent(db, data)
 

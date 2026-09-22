@@ -90,7 +90,8 @@ uv run ruff format . --exclude .venv --exclude migrations --check
 
 ### Detalhes de infraestrutura
 
-- `docker compose up -d` sobe o Postgres (`db`) e o RabbitMQ (`queue`).
+- `docker compose up -d` sobe Postgres (`db`), RabbitMQ (`queue`) e a stack de
+  observabilidade — Prometheus, Loki, Promtail e Grafana (bônus, seção 13).
 - O Postgres do compose é publicado na porta **5433** (e não 5432) para não
   conflitar com um Postgres local. Ajuste `DATABASE_PORT` no `.env`.
 - RabbitMQ: `5672` (AMQP) e `15672` (management UI, `http://localhost:15672`).
@@ -314,8 +315,11 @@ Para integrar ERP, transportadora e gateway de pagamento de forma independente:
    sistema externo também saiba deduplicar o envio.
 5. **Padrão outbox** para publicar eventos na mesma transação do estado, eliminando
    a janela entre commit e publish.
-6. **Observabilidade:** correlation id (`external_id`) propagado em todos os logs,
-   métricas por fila (profundidade, taxa de falha, latência) e tracing distribuído.
+6. **Observabilidade:** métricas (Prometheus) e busca de logs (Loki) já existem
+   nesta entrega como bônus (seção 13); para múltiplos sistemas faltaria métricas
+   por fila (profundidade, taxa de falha, latência por integração) e tracing
+   distribuído com um correlation id propagado por toda a cadeia, hoje limitado ao
+   `external_id` em cada log isolado.
 7. **Escala:** múltiplos consumidores por fila com prefetch ajustado. Para preservar
    ordem por pedido, particionar por `external_id` (hash exchange) ou usar filas
    shardeadas.
@@ -339,7 +343,8 @@ O que foi deliberadamente simplificado:
   endpoints de consulta e CRUD.
 - **Paginação por offset** em `GET /orders` (simples, mas pode pular/repetir itens se houver inserções entre páginas e fica mais lenta em offsets muito altos; a ordenação `created_at, id` e o índice `(status, created_at)` mitigam).
 - **Sem Makefile/justfile.** Comandos diretos com `uv`, `docker compose` e `alembic`.
-- **Docker Compose só para Postgres e RabbitMQ;** API e worker rodam via `uv` (o
+- **Docker Compose para infraestrutura (Postgres, RabbitMQ, e a stack de
+  observabilidade — seção 13);** API e worker continuam rodando via `uv` (o
   `Dockerfile` é usado no deploy).
 - **Modelo de itens do pedido removido.** Chegou a existir `OrderItem`, mas nenhum
   endpoint criava itens e o payload do desafio não os tem; foi removido em vez de
@@ -381,14 +386,35 @@ O que ficou de fora e como seria implementado:
   `lazy load` que estouraria `MissingGreenlet` em `OrderItemOut.product`, da
   corrida de `INSERT` na idempotência, do dual-write entre commit e publish e da
   migração com downgrade inválido.
+- Implementação do bônus de observabilidade (seção 13): instrumentação
+  Prometheus na API/worker, contadores de negócio (`utils/metrics.py`), log em
+  arquivo para o Promtail (`utils/logger.py`) e a stack Prometheus + Loki +
+  Promtail + Grafana no `docker-compose.yml`, incluindo o dashboard provisionado.
+- Correção de erros do `basedpyright` (`reportArgumentType` na conversão
+  `Order` → `OrderOut`, `Decimal` vs `str` em um teste, `dict`/`async_sessionmaker`
+  sem parâmetros genéricos) apontados pelo editor do candidato durante a sessão.
+- Diagnóstico e correção de um loop de log introduzido pela própria observabilidade:
+  com `fastapi dev` (hot-reload) e log em arquivo ligados juntos, cada linha
+  gravada em `logs/app.jsonl` era detectada pelo `watchfiles` como mudança,
+  logada, gravada de novo, detectada de novo — loop infinito sem reiniciar o
+  processo. Reproduzido isoladamente antes de corrigir, para confirmar a causa em
+  vez de arriscar (ver nota na seção 13).
 - Apoio na redação deste README.
 
 **Como o código foi revisado e validado:**
 
-- `uv run pytest` — 52 testes passando, sem depender de serviços externos (CRUD, idempotência incluindo a recuperação
+- `uv run pytest` — 55 testes passando, sem depender de serviços externos (CRUD, idempotência incluindo a recuperação
   do `IntegrityError`, formatos de payload, 404/422, filtro por status, reprocessamento, broker fora do ar e o worker: sucesso, rejeição, retry com recuperação, esgotamento, timeout, mensagem duplicada e consumidores concorrentes).
 - `uv run ruff check` e `uv run ruff format --check` sem pendências.
 - `uv run alembic check` — nenhuma divergência entre os models e o schema do banco.
+- `uv run basedpyright .` — 0 erros (avisos remanescentes são de modo estrito em
+  código de terceiros/fixtures de teste, não corrigidos por estarem fora do escopo
+  do que foi reportado).
+- Stack de observabilidade validada de ponta a ponta com os serviços reais: pedido
+  criado duas vezes refletindo em `orders_received_total=1` e
+  `orders_duplicate_total=1` na API, `orders_processed_total{status="PROCESSED"}=1`
+  no worker, e as mesmas linhas de log aparecendo em uma consulta ao Loki
+  (`{job="pure_electric_app"}`).
 - Execução manual do fluxo completo com Postgres e RabbitMQ reais: `POST /orders`
   (201, `RECEIVED`) → worker consumindo → `GET /orders/{id}` com status final
   `PROCESSED`/`FAILED`, `processed_at` carimbado e `failure_reason` preenchido só no
@@ -447,4 +473,72 @@ mudar o valor exige um novo deploy. O `vercel.json` reescreve todas as rotas par
 
 Depois do primeiro deploy do frontend, volte ao Railway e ajuste `CORS_ORIGINS` para a
 URL final da Vercel; várias origens são separadas por vírgula.
+
+---
+
+## 13. Observabilidade (bônus): métricas e logs
+
+Os logs estruturados (`utils/logger.py`) já existiam e cobrem o item desejável
+"logs estruturados com correlação pedido/evento" — cada linha JSON carrega
+`external_id`/`order_id` em `extra`. O que foi adicionado aqui é o bônus
+"observabilidade, métricas e/ou tracing": um jeito de **ver** esses dados agregados,
+em vez de só grep no stdout.
+
+**O que cada peça faz** (Grafana sozinho não faz nada — ele só visualiza; quem
+guarda os dados são as duas fontes abaixo):
+
+| Peça | Papel |
+|---|---|
+| **Prometheus** | Coleta métricas numéricas via *scrape* HTTP: taxa de requisições, latência da API (`prometheus-fastapi-instrumentator`) e contadores de negócio — `orders_received_total`, `orders_duplicate_total` (hits de idempotência), `orders_processed_total{status}` (`utils/metrics.py`). |
+| **Loki + Promtail** | Indexam os logs JSON que a aplicação já grava em `logs/app.jsonl` (`utils/logger.py`, controlado por `LOG_DIR`). Promtail faz o *tail* do arquivo e envia para o Loki; dá para buscar por `external_id`/`order_id` depois, sem depender do terminal onde o processo rodou. |
+| **Grafana** | Um dashboard já provisionado (`observability/grafana/dashboards/pure-electric.json`) — taxa de requisições HTTP, p95 de latência, pedidos recebidos/processados por status, e um painel de logs ao vivo. |
+
+### Como subir
+
+```bash
+docker compose up -d          # inclui prometheus, loki, promtail e grafana
+uv run fastapi run main.py    # ⚠️ não use "fastapi dev" — ver nota abaixo
+uv run python run_worker.py
+```
+
+- Grafana: **http://localhost:3001** (login `admin`/`admin` por padrão — vem do
+  `.env`, `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD` — ou acesso anônimo como
+  *Viewer*, já habilitado via `GRAFANA_ANONYMOUS_ENABLED`) — dashboard "Pure
+  Electric — Orders" fica pronto, sem precisar configurar nada.
+- Prometheus: http://localhost:9090/targets (para conferir se os dois *scrape
+  targets* estão `UP`).
+- API: métricas cruas em http://localhost:8000/metrics; worker em
+  http://localhost:9200/metrics (porta configurável por `WORKER_METRICS_PORT`).
+
+> **Por que `fastapi run` e não `fastapi dev` aqui:** testando isso, descobri que
+> `fastapi dev` faz *bind* só em `127.0.0.1` por padrão. Como Prometheus roda dentro
+> do Docker e alcança o host via `host.docker.internal` (gateway da bridge, não
+> `localhost`), ele não consegue fechar a conexão nesse modo — o *scrape target* da
+> API fica `down` com "connection refused" (confirmei isso ao subir a stack: o alvo
+> do worker, que já escuta em `0.0.0.0`, sobe `UP` na hora; o da API, não). `fastapi
+> run` (modo produção, usado no Dockerfile/deploy) já faz bind em `0.0.0.0` e
+> resolve. Para manter `fastapi dev` com hot-reload e ainda assim ser raspado, use
+> `uv run fastapi dev main.py --host 0.0.0.0`.
+>
+> **Pegadinha nº 2, achada usando essa combinação:** com hot-reload ligado, cada
+> linha que a aplicação grava em `logs/app.jsonl` é, ela mesma, uma mudança de
+> arquivo dentro do diretório observado pelo `watchfiles` — que loga a detecção,
+> essa linha de log é gravada de novo em `logs/app.jsonl`, que é detectada de novo,
+> em loop infinito (sem reiniciar o processo de verdade — `watchfiles` só loga; o
+> filtro de reload do uvicorn não considera `.jsonl`, então nenhum estado se perde,
+> mas o terminal e o arquivo de log crescem sem parar). Corrigido subindo o nível do
+> logger `watchfiles` para `WARNING` em `setup_logging()` (`utils/logger.py`), o
+> mesmo padrão já usado para silenciar `sqlalchemy.engine`.
+
+### O que ficou de fora (mesmo como bônus)
+
+- **Tracing distribuído.** Dá pra ver "quanto tempo a API levou" e "quanto tempo o
+  worker levou" separadamente, mas não um único trace amarrando request →
+  publish → consumo → chamada ao sistema interno. Precisaria de OpenTelemetry e um
+  correlation/trace id propagado pela mensagem da fila (relacionado à pendência #7
+  da seção 10).
+- **Alerting.** Sem regras do Prometheus/Alertmanager; hoje é só visualização sob
+  demanda.
+- **Métricas de infraestrutura** (RabbitMQ, Postgres): daria para ligar o plugin
+  `rabbitmq_prometheus` e um `postgres_exporter`, mas fora do escopo do bônus.
 
