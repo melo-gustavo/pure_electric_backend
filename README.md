@@ -490,14 +490,14 @@ guarda os dados são as duas fontes abaixo):
 | Peça | Papel |
 |---|---|
 | **Prometheus** | Coleta métricas numéricas via *scrape* HTTP: taxa de requisições, latência da API (`prometheus-fastapi-instrumentator`) e contadores de negócio — `orders_received_total`, `orders_duplicate_total` (hits de idempotência), `orders_processed_total{status}` (`utils/metrics.py`). |
-| **Loki + Promtail** | Indexam os logs JSON que a aplicação já grava em `logs/app.jsonl` (`utils/logger.py`, controlado por `LOG_DIR`). Promtail faz o *tail* do arquivo e envia para o Loki; dá para buscar por `external_id`/`order_id` depois, sem depender do terminal onde o processo rodou. |
+| **Loki** | Indexa os logs JSON. A própria aplicação envia (`utils/logger.py`, `LokiHandler`) direto pro endpoint HTTP de push do Loki, de um *background thread* que faz batch a cada 2s — sem depender de arquivo em disco nem de um shipper como Promtail. Isso importa porque API e worker rodam como containers separados e sem filesystem compartilhado (Railway); ligado por `LOKI_URL`, desligado (só stdout) se a variável não existir. Nunca bloqueia nem derruba a aplicação: qualquer falha de rede no push é engolida. |
 | **Grafana** | Um dashboard já provisionado (`observability/grafana/dashboards/pure-electric.json`) — taxa de requisições HTTP, p95 de latência, pedidos recebidos/processados por status, e um painel de logs ao vivo. |
 
-### Como subir
+### Como subir localmente
 
 ```bash
-docker compose up -d          # inclui prometheus, loki, promtail e grafana
-uv run fastapi run main.py    # ⚠️ não use "fastapi dev" — ver nota abaixo
+docker compose up -d          # inclui prometheus, loki e grafana
+uv run fastapi run main.py    # ⚠️ não use "fastapi dev" sem --host — ver nota abaixo
 uv run python run_worker.py
 ```
 
@@ -509,26 +509,45 @@ uv run python run_worker.py
   targets* estão `UP`).
 - API: métricas cruas em http://localhost:8000/metrics; worker em
   http://localhost:9200/metrics (porta configurável por `WORKER_METRICS_PORT`).
+- `LOKI_URL=http://localhost:3100` no `.env` liga o envio de logs; vazio/ausente
+  desliga (só stdout).
 
-> **Por que `fastapi run` e não `fastapi dev` aqui:** testando isso, descobri que
-> `fastapi dev` faz *bind* só em `127.0.0.1` por padrão. Como Prometheus roda dentro
-> do Docker e alcança o host via `host.docker.internal` (gateway da bridge, não
-> `localhost`), ele não consegue fechar a conexão nesse modo — o *scrape target* da
-> API fica `down` com "connection refused" (confirmei isso ao subir a stack: o alvo
-> do worker, que já escuta em `0.0.0.0`, sobe `UP` na hora; o da API, não). `fastapi
-> run` (modo produção, usado no Dockerfile/deploy) já faz bind em `0.0.0.0` e
-> resolve. Para manter `fastapi dev` com hot-reload e ainda assim ser raspado, use
-> `uv run fastapi dev main.py --host 0.0.0.0`.
->
-> **Pegadinha nº 2, achada usando essa combinação:** com hot-reload ligado, cada
-> linha que a aplicação grava em `logs/app.jsonl` é, ela mesma, uma mudança de
-> arquivo dentro do diretório observado pelo `watchfiles` — que loga a detecção,
-> essa linha de log é gravada de novo em `logs/app.jsonl`, que é detectada de novo,
-> em loop infinito (sem reiniciar o processo de verdade — `watchfiles` só loga; o
-> filtro de reload do uvicorn não considera `.jsonl`, então nenhum estado se perde,
-> mas o terminal e o arquivo de log crescem sem parar). Corrigido subindo o nível do
-> logger `watchfiles` para `WARNING` em `setup_logging()` (`utils/logger.py`), o
-> mesmo padrão já usado para silenciar `sqlalchemy.engine`.
+> **Por que `fastapi run` (ou `fastapi dev --host 0.0.0.0`) e não `fastapi dev`
+> puro aqui:** testando isso, descobri que `fastapi dev` faz *bind* só em
+> `127.0.0.1` por padrão. Como Prometheus roda dentro do Docker e alcança o host
+> via `host.docker.internal` (gateway da bridge, não `localhost`), ele não
+> consegue fechar a conexão nesse modo — o *scrape target* da API fica `down` com
+> "connection refused" (confirmei isso ao subir a stack: o alvo do worker, que já
+> escuta em `0.0.0.0`, sobe `UP` na hora; o da API, não). `fastapi run` (modo
+> produção, usado no Dockerfile/deploy) já faz bind em `0.0.0.0` e resolve.
+
+### Deploy no Railway
+
+Além dos 4 serviços do deploy principal (seção 12), a stack de observabilidade
+sobe como **3 serviços a mais** no mesmo projeto Railway — Prometheus, Loki e
+Grafana — cada um construído a partir de um `Dockerfile` próprio em
+`observability/<serviço>/`, que empacota a config estática (não dá pra montar um
+arquivo local num serviço de imagem pronta do Docker Hub no Railway, então a
+config vai dentro da imagem, no build):
+
+1. Para cada um (**Prometheus**, **Loki**, **Grafana**): *New → GitHub Repo* →
+   `melo-gustavo/pure_electric_backend` → em *Settings → Source*, defina o **Root
+   Directory** como `observability/prometheus` (ou `loki`/`grafana`) — o Railway
+   detecta o `Dockerfile` ali automaticamente.
+2. **Grafana** precisa de domínio público (*Settings → Networking → Generate
+   Domain*) para você acessar o dashboard pelo navegador; Prometheus e Loki
+   **não** — só precisam conversar com os outros serviços pela rede privada
+   (`*.railway.internal`).
+3. Variáveis do serviço **Grafana**: `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD`
+   — **troque o padrão `admin`/`admin`** aqui, já que esse Grafana fica exposto
+   publicamente (diferente do local, atrás do seu próprio Docker). Considere
+   também desligar `GF_AUTH_ANONYMOUS_ENABLED` em produção.
+4. Variáveis a acrescentar em `pure_electric_backend` e `worker-orders`
+   (serviços que já existem): `LOKI_URL=http://<domínio privado do Loki>:3100`.
+5. `observability/prometheus/prometheus.yml` referencia os domínios privados da
+   API e do worker (`<serviço>.railway.internal:<porta>`) em vez de
+   `host.docker.internal` — o domínio privado de cada serviço aparece em
+   *Settings → Networking* dele; ajuste antes do deploy se os nomes mudarem.
 
 ### O que ficou de fora (mesmo como bônus)
 

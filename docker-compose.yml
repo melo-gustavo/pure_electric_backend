@@ -56,17 +56,6 @@ services:
     volumes:
       - pure_electric_loki_data:/loki
 
-  promtail:
-    image: grafana/promtail:3.0.0
-    container_name: pure_electric_promtail
-    restart: unless-stopped
-    depends_on:
-      - loki
-    volumes:
-      - ./observability/promtail-config.yml:/etc/promtail/config.yml:ro
-      - ./logs:/var/log/app:ro
-    command: -config.file=/etc/promtail/config.yml
-
   grafana:
     image: grafana/grafana:latest
     container_name: pure_electric_grafana
@@ -79,6 +68,8 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS_ENABLED:-true}
       GF_AUTH_ANONYMOUS_ORG_ROLE: ${GRAFANA_ANONYMOUS_ORG_ROLE:-Viewer}
+      GRAFANA_PROMETHEUS_URL: http://prometheus:9090
+      GRAFANA_LOKI_URL: http://loki:3100
     volumes:
       - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
